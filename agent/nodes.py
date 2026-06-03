@@ -1,8 +1,9 @@
 import re
+from functools import lru_cache
 from typing import Any
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from langchain_anthropic import ChatAnthropic
+from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 
 from agent.state import AgentState
@@ -16,19 +17,13 @@ from db.session import get_session
 
 MAX_RETRIES = 2
 
-_llm_instance: ChatAnthropic | None = None
+_llm = None
 
 
-def get_llm() -> ChatAnthropic:
-    """
-    Lazy LLM initialization — avoids crashing on import when no API key is set.
-    Returns the same instance on every call (manual singleton).
-    Tests can replace _llm_instance directly without cache issues.
-    """
-    global _llm_instance
-    if _llm_instance is None:
-        _llm_instance = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
-    return _llm_instance
+@lru_cache(maxsize=1)
+def get_llm() -> ChatGroq:
+    """Lazy LLM initialization — avoids crashing on import when no API key is set."""
+    return ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
 
 def generate_sql(state: AgentState) -> dict[str, Any]:
@@ -36,7 +31,7 @@ def generate_sql(state: AgentState) -> dict[str, Any]:
     error_context = ""
     if state.get("error") and state.get("retry_count", 0) > 0:
         error_context = (
-            f"Previous attempt failed with error: {state['error']}\n"
+            f"Previous attempt failed with error: {state.get('error')}\n"
             f"Previous SQL was: {state.get('sql_query', 'N/A')}\n"
             "Please fix the query.\n\n"
         )
@@ -44,7 +39,7 @@ def generate_sql(state: AgentState) -> dict[str, Any]:
     prompt = SQL_GENERATION_PROMPT.format(
         schema=get_schema_context(),
         error_context=error_context,
-        question=state["question"],
+        question=state.get("question"),
     )
 
     response = get_llm().invoke([HumanMessage(content=prompt)])
@@ -52,7 +47,7 @@ def generate_sql(state: AgentState) -> dict[str, Any]:
 
     return {
         "sql_query": sql,
-        "error": None,  # Clear previous error on new attempt
+        "error": None,
     }
 
 
@@ -83,7 +78,7 @@ def validate_sql(state: AgentState) -> dict[str, Any]:
 
 def execute_sql(state: AgentState) -> dict[str, Any]:
     """Run the validated SQL query and return rows as a list of dicts."""
-    sql = state.get("sql_query", "")
+    sql = state.get("sql_query")
     session = get_session()
     try:
         result = session.execute(text(sql))
@@ -100,8 +95,8 @@ def format_answer(state: AgentState) -> dict[str, Any]:
     """Ask the LLM to turn raw DB rows into a human-readable answer."""
     results = state.get("sql_results") or []
     prompt = FORMAT_ANSWER_PROMPT.format(
-        question=state["question"],
-        sql_query=state.get("sql_query", ""),
+        question=state.get("question"),
+        sql_query=state.get("sql_query"),
         results=results if results else "No results found.",
     )
     response = get_llm().invoke([HumanMessage(content=prompt)])
@@ -114,7 +109,7 @@ def handle_error(state: AgentState) -> dict[str, Any]:
     instead of crashing or returning raw error text to the user.
     """
     prompt = CANNOT_ANSWER_PROMPT.format(
-        question=state["question"],
+        question=state.get("question"),
         error=state.get("error", "Unknown error"),
     )
     response = get_llm().invoke([HumanMessage(content=prompt)])
