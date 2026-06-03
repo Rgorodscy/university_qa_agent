@@ -164,13 +164,13 @@ class TestGenerateSql:
 
 
 @pytest.fixture(autouse=True)
-def clear_llm_cache():
-    """Clear lru_cache on get_llm before each test so mocks work correctly."""
-    from agent.nodes import get_llm
+def reset_llm():
+    """Reset _llm_instance before and after each test so mocks work correctly."""
+    import agent.nodes as nodes_module
 
-    get_llm.cache_clear()
+    nodes_module._llm_instance = None
     yield
-    get_llm.cache_clear()
+    nodes_module._llm_instance = None
 
 
 @pytest.fixture(scope="module", autouse=True)
