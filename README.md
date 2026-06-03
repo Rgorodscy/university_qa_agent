@@ -1,5 +1,3 @@
-[![CI](https://github.com/Rgorodscy/university_qa_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Rgorodscy/university_qa_agent/actions/workflows/ci.yml)
-
 # University QA Agent
 
 A natural language question-answering system over a university database, built with LangGraph, FastAPI, and SQLAlchemy.
