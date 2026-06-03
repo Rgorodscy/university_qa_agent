@@ -1,3 +1,5 @@
+[![CI](https://github.com/Rgorodscy/university_qa_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Rgorodscy/university_qa_agent/actions/workflows/ci.yml)
+
 # University QA Agent
 
 A natural language question-answering system over a university database, built with LangGraph, FastAPI, and SQLAlchemy.
@@ -148,6 +150,10 @@ python main.py "Who teaches Algorithms?"
 
 # API server
 uvicorn api.app:app --reload
+# → http://localhost:8000/docs
+
+# Or with Docker
+docker-compose up --build
 # → http://localhost:8000/docs
 ```
 
