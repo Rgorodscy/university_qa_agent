@@ -12,17 +12,23 @@ Users ask questions in plain English. The agent translates them to SQL, executes
 User question
      │
      ▼
-┌─────────────────────────────────────────────┐
-│              LangGraph Agent                │
-│                                             │
-│  generate_sql → validate_sql → execute_sql  │
-│       ▲              │               │      │
-│       │         [invalid]        [error]    │
-│       └──── increment_retry ────────┘       │
-│                                             │
-│                        └──→ format_answer   │
-│                        └──→ handle_error    │
-└─────────────────────────────────────────────┘
+POST /agent/query          (FastAPI — transport only)
+     │
+     ▼
+ask(question)              (agent/graph.py)
+     │
+     ▼
+┌─────────────────────────────────────────────────┐
+│                LangGraph Agent                  │
+│                                                 │
+│  generate_sql → validate_sql → execute_sql      │
+│       ▲              │               │          │
+│       │         [invalid]        [error]        │
+│       └──── increment_retry ────────┘           │
+│                                                 │
+│                         └──→ format_answer → END│
+│                         └──→ handle_error  → END│
+└─────────────────────────────────────────────────┘
      │
      ▼
   Final answer
@@ -30,13 +36,17 @@ User question
 
 ### Key design decisions
 
-**DB-agnostic agent** — the agent has no hardcoded knowledge of the schema. Table names, columns, and relationships are injected via a schema context string in `agent/prompts.py`. To adapt the agent to a different database, only that file needs to change.
+**Truly DB-agnostic agent** — the agent has no hardcoded schema knowledge. The schema context is generated dynamically at startup by introspecting the live database via SQLAlchemy's inspector. Adding a new table to `models.py` is automatically reflected in the agent's prompt with zero manual updates.
 
-**LangGraph over a plain chain** — conditional edges enable the retry loop (bad SQL → regenerate) and explicit state makes every step inspectable. A plain LangChain chain can't express this routing cleanly.
+**LangGraph over a plain chain** — conditional edges enable the retry loop (bad SQL → regenerate with error context) and explicit state makes every step inspectable. A plain LangChain chain can't express this routing.
 
 **SQLAlchemy over raw SQL** — the engine abstraction means SQLite locally and PostgreSQL in production with zero code changes.
 
-**FastAPI as a thin transport layer** — the API has no business logic. It calls `ask()` from `agent/graph.py` and returns the result. The agent is completely unaware the API exists.
+**Router/CRUD/schemas structure** — each API resource is a package with three files: `router.py` handles HTTP, `crud.py` handles database operations, `schemas.py` handles validation. Each layer has exactly one responsibility.
+
+**FastAPI as a thin transport layer** — the API has no business logic. It calls `ask()` and returns the result. The agent is completely unaware the API exists.
+
+**Request logging middleware** — every HTTP request is logged with method, path, status code, and duration. Complements LangSmith's agent-level tracing with application-level observability.
 
 ---
 
@@ -45,23 +55,36 @@ User question
 ```
 university_qa_agent/
 ├── agent/
-│   ├── state.py        # AgentState TypedDict — shared state across all nodes
+│   ├── state.py        # AgentState TypedDict
 │   ├── nodes.py        # Node functions + conditional routing logic
 │   ├── graph.py        # LangGraph graph wiring and ask() entrypoint
-│   └── prompts.py      # Prompt templates and schema context (isolated)
+│   └── prompts.py      # Prompt templates + dynamic schema context
 ├── api/
-│   ├── app.py          # FastAPI routes (CRUD + /agent/query)
-│   └── schemas.py      # Pydantic request/response models
+│   ├── app.py          # FastAPI app, middleware, router registration
+│   └── routers/
+│       ├── teachers/
+│       │   ├── router.py    # HTTP layer
+│       │   ├── crud.py      # DB layer
+│       │   └── schemas.py   # Pydantic models
+│       ├── students/
+│       ├── courses/
+│       ├── offerings/
+│       ├── enrollments/
+│       └── agent/
+│           ├── router.py    # HTTP layer
+│           └── schemas.py   # no crud — talks to LangGraph
 ├── db/
 │   ├── models.py       # SQLAlchemy ORM models
-│   ├── session.py      # Engine, session factory, FastAPI dependency
+│   ├── session.py      # Engine, session factory, schema introspection
 │   └── seed.py         # Seed data (5 teachers, 10 students, 8 courses)
 ├── tests/
 │   ├── test_db.py      # DB queries, joins, aggregations
 │   ├── test_sql_gen.py # SQL generation and validation nodes
-│   └── test_agent.py   # End-to-end graph behavior (mocked LLM)
+│   ├── test_agent.py   # End-to-end graph behavior (mocked LLM)
+│   └── test_api.py     # All API endpoints (FastAPI TestClient)
 ├── conftest.py         # pytest path setup
 ├── main.py             # CLI entrypoint
+├── demo.py             # Error loop demonstration tool
 └── pytest.ini
 ```
 
@@ -69,24 +92,15 @@ university_qa_agent/
 
 ## Database Schema
 
-```
-teachers          students
-    │                 │
-    │                 │
-course_offerings ─────┘ (via enrollments)
-    │
-courses
-```
+| Table              | Description                                                        |
+| ------------------ | ------------------------------------------------------------------ |
+| `teachers`         | name, department, email                                            |
+| `students`         | name, email, major                                                 |
+| `courses`          | code (CS101), name, credits                                        |
+| `course_offerings` | course + teacher + semester — represents a specific class instance |
+| `enrollments`      | student + offering + grade (nullable)                              |
 
-| Table              | Description                           |
-| ------------------ | ------------------------------------- |
-| `teachers`         | name, department, email               |
-| `students`         | name, email, major                    |
-| `courses`          | code (CS101), name, credits           |
-| `course_offerings` | course + teacher + semester           |
-| `enrollments`      | student + offering + grade (nullable) |
-
-`CourseOffering` is the join between a course, a teacher, and a semester. This allows the same course to be taught by different teachers across semesters. `Enrollment` links a student to a specific offering and holds their grade.
+**Why CourseOffering?** The same course can be taught by different teachers across semesters. CourseOffering is the junction between course, teacher, and semester. Enrollment links a student to a specific offering and holds their grade — not the course itself.
 
 ---
 
@@ -104,8 +118,7 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 **2. Install dependencies**
 
 ```bash
-pip install sqlalchemy fastapi uvicorn langgraph langchain langchain-groq \
-            langsmith pydantic pytest httpx python-dotenv
+pip install -r requirements.txt
 ```
 
 **3. Configure environment**
@@ -168,48 +181,77 @@ curl -X POST http://localhost:8000/agent/query \
   -H "Content-Type: application/json" \
   -d '{"question": "Who teaches Algorithms?"}'
 
+# List all teachers
+curl http://localhost:8000/teachers
+
 # Add a teacher
 curl -X POST http://localhost:8000/teachers \
   -H "Content-Type: application/json" \
   -d '{"name": "Dr. New Teacher", "department": "Physics", "email": "new@university.edu"}'
 
-# List all students
-curl http://localhost:8000/students
+# Health check
+curl http://localhost:8000/health
 ```
+
+---
+
+## Demonstrating the Error Loop
+
+The agent has a built-in retry loop — if SQL generation fails validation or execution, the error is injected back into the next prompt so the LLM can self-correct.
+
+Use `demo.py` to exercise this path on demand:
+
+```bash
+# Attempt 1 fails (forbidden SQL), agent recovers on attempt 2
+python demo.py retry
+
+# All attempts fail, agent gives up gracefully
+python demo.py exhausted
+```
+
+Every run appears in LangSmith with the full node trace — including the `increment_retry` node between attempts.
 
 ---
 
 ## Tracing
 
-Every agent run is traced automatically via LangSmith when `LANGCHAIN_TRACING_V2=true` is set. The trace shows:
+Every agent run is traced automatically via LangSmith when `LANGCHAIN_TRACING_V2=true` is set.
+
+The trace shows:
 
 - Full path: user input → each LangGraph node → SQL → DB results → final answer
 - Per-node latency and LLM call duration
-- Retry attempts and error messages
+- Retry attempts with error context
 - Input/output at every step
 
 View traces at `smith.langchain.com` under the `university-qa` project.
+
+Application-level observability is handled by the request logging middleware in `api/app.py` — every HTTP request is logged with method, path, status code, and duration.
 
 ---
 
 ## Tests
 
 ```bash
-pytest           # run all 41 tests
-pytest -v        # verbose output
+pytest              # run all 70 tests
+pytest -v           # verbose output
 pytest tests/test_db.py         # DB layer only
 pytest tests/test_agent.py      # agent behavior only
+pytest tests/test_api.py        # API endpoints only
+pytest tests/test_agent.py::TestRetryLoopDemo  # retry loop specifically
 ```
 
 No API key required — LLM calls are fully mocked. Tests cover:
 
 - Schema integrity and seed data correctness
 - Multi-table joins and aggregations
+- NULL grade handling
 - SQL validation (blocks DROP, INSERT, DELETE, UPDATE)
 - LLM output cleaning (strips markdown fences)
-- Retry logic on invalid or failing SQL
-- Graceful failure after max retries
+- Retry recovery — agent self-corrects using previous error context
+- Retry exhaustion — graceful failure after max retries
 - Empty result handling
+- All API endpoints — status codes, validation, 404s
 
 ---
 
@@ -218,31 +260,32 @@ No API key required — LLM calls are fully mocked. Tests cover:
 **Reliability**
 
 - Replace SQLite with PostgreSQL for concurrent writes
-- Add connection pooling via SQLAlchemy's `pool_size` / `max_overflow`
+- Add connection pooling via SQLAlchemy `pool_size` / `max_overflow`
 - Wrap LLM calls with retry + exponential backoff for transient API errors
-- Set `MAX_RETRIES` via environment variable rather than hardcoded
+- Set `MAX_RETRIES` via environment variable
 
 **Scalability**
 
-- Deploy FastAPI behind a load balancer (e.g. Nginx + multiple Uvicorn workers)
+- Deploy FastAPI behind a load balancer with multiple Uvicorn workers
 - Move to async SQLAlchemy (`asyncpg`) for non-blocking DB calls under load
 - Cache frequent identical questions with Redis (question hash → answer)
 
 **Security**
 
-- The `validate_sql` node blocks all non-SELECT statements — extend it with an allowlist of permitted tables
-- Add authentication to the FastAPI layer (JWT or API key header)
-- Never expose raw SQL or DB errors in API responses (currently handled by `handle_error`)
+- `validate_sql` blocks all non-SELECT statements — extend with table allowlist
+- Add JWT authentication to the FastAPI layer
+- Never expose raw SQL or stack traces in API responses (handled by `handle_error`)
 - Rotate LLM API keys via secrets manager (AWS Secrets Manager / Vault)
 
 **Monitoring**
 
-- LangSmith already provides per-run tracing, latency, and error rates
-- Add `/health` and `/metrics` endpoints for infrastructure monitoring
-- Alert on high `retry_count` values — signals prompt or schema drift
+- LangSmith provides per-run tracing, latency, and error rates for the agent
+- Request logging middleware covers the HTTP layer
+- Add Prometheus metrics and alert on high `retry_count` values — signals prompt or schema drift
+- OpenTelemetry for distributed tracing across all layers in production
 
 **Deployment**
 
-- Containerise with Docker (`Dockerfile` + `docker-compose.yml`)
+- Containerise with Docker
 - Run DB migrations with Alembic instead of `create_all()`
 - Separate read replicas for agent queries vs write path for CRUD operations
