@@ -1,4 +1,5 @@
 import re
+from functools import lru_cache
 from typing import Any
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -16,19 +17,13 @@ from db.session import get_session
 
 MAX_RETRIES = 2
 
-_llm_instance: ChatGroq | None = None
+_llm = None
 
 
+@lru_cache(maxsize=1)
 def get_llm() -> ChatGroq:
-    """
-    Lazy LLM initialization — avoids crashing on import when no API key is set.
-    Returns the same instance on every call (manual singleton).
-    Tests can replace _llm_instance directly without cache issues.
-    """
-    global _llm_instance
-    if _llm_instance is None:
-        _llm_instance = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-    return _llm_instance
+    """Lazy LLM initialization — avoids crashing on import when no API key is set."""
+    return ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
 
 def generate_sql(state: AgentState) -> dict[str, Any]:
